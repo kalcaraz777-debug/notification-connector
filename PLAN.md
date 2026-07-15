@@ -28,23 +28,55 @@ The only ways to tap the raw OS notification stream are brittle:
 the ~10–15 sources you actually care about; they all land in one feed. This is
 more reliable and is what a "life's dashboard" actually wants.
 
+## Design priority: immediate (real-time)
+
+The goal is that a notification shows up on the dashboard **within a second or two**
+of hitting your phone — no refresh, no polling delay. That single requirement
+drives three decisions:
+
+- **Push, not poll.** The browser holds an open connection and the server *pushes*
+  each new event. We use **Server-Sent Events (SSE)** — one-way server→browser,
+  auto-reconnects, trivial compared to WebSockets, and perfect for a feed.
+- **The server must stay alive to hold that connection.** Plain serverless
+  functions (Vercel/Lambda) time out and can't hold SSE open. So either run a
+  **persistent server** (Render / Fly / Railway) *or* offload realtime to a
+  managed service (see below).
+- **Fan-out the instant a row is written.** On insert we notify all connected
+  browsers immediately, using Postgres **`LISTEN`/`NOTIFY`** (or Supabase Realtime).
+
+### The fastest path: Supabase
+
+Supabase gives us Postgres **and** Realtime in one box: insert a row, and the
+insert streams to every subscribed browser over a WebSocket Supabase manages for
+us — no persistent server of our own required, works even from serverless ingest.
+Given "immediate" + "hosted Postgres" (both already chosen), **this is the
+recommended stack.** The SSE-on-a-persistent-server option below is the fallback if
+you'd rather not depend on Supabase Realtime.
+
 ## Architecture
 
 ```
-  Feeders                    Connector (this repo)              Dashboard
-  ─────────                  ─────────────────────              ─────────
-  iOS Shortcuts   ─┐
-  Zapier / IFTTT  ─┼──POST──▶  POST /events  ──▶  Postgres  ──▶  GET / (feed)
-  Native webhooks ─┘           (auth + validate + store)         GET /events (JSON API)
+  Feeders                 Connector (this repo)            Dashboard (live)
+  ─────────               ─────────────────────            ────────────────
+  iOS Shortcuts   ─┐                                    ┌─ open SSE / Realtime
+  Zapier / IFTTT  ─┼─POST─▶ POST /events ─▶ Postgres ─┤  connection, held open
+  Native webhooks ─┘        (auth+validate)   │ insert  └─ new event pushed in
+                                              │            ~1s, prepended to feed
+                                              ▼
+                                    NOTIFY / Realtime fan-out
+                                    ─▶ every connected browser
 ```
 
-Three pieces:
+Pieces:
 
-1. **Ingest endpoint** — `POST /events`, token-authenticated, validates a small
-   JSON shape, writes one row.
-2. **Store** — hosted Postgres (Supabase or Neon free tier).
-3. **Dashboard** — a web page that reads recent events and renders a feed, plus a
-   small JSON API behind the same page.
+1. **Ingest endpoint** — `POST /events`, token-authenticated, validates, writes one
+   row. Must respond fast (Shortcuts time out quickly) — write, fire the notify,
+   return.
+2. **Store** — hosted Postgres (Supabase recommended, for its Realtime).
+3. **Realtime fan-out** — Supabase Realtime, or Postgres `LISTEN`/`NOTIFY` bridged
+   to SSE on a persistent server.
+4. **Dashboard** — opens a live connection on load, renders the last ~50 events,
+   then prepends each pushed event as it arrives.
 
 ## Data model (Postgres)
 
@@ -120,12 +152,22 @@ Build one reusable Shortcut called **"Send to Dashboard"**:
 
 Now you can fire it two ways:
 - **Share Sheet** — from almost any app or a long-pressed notification, tap
-  Share → "Send to Dashboard".
+  Share → "Send to Dashboard". Instant.
 - **Personal Automations** (Shortcuts → Automation → +). iOS gives you specific
   triggers, not a generic "any notification," but useful ones exist: a message
   from a specific person, an email, arriving/leaving a place, a Focus turning
   on/off, an app being opened, an NFC tag tap, a time of day. Each automation can
   run the "Send to Dashboard" shortcut.
+
+**For immediacy, turn OFF "Ask Before Running" on every automation** (toggle
+"Run Immediately"). Otherwise iOS posts a *tap-to-confirm* banner and nothing sends
+until you tap it — which kills the "immediate" goal. With it off, the POST fires
+the moment the trigger hits. The end-to-end delay is then just: trigger → HTTPS
+POST → insert → realtime push → browser. Typically ~1s.
+
+One honest limit on the phone side: iOS automations run reliably but not always to
+the millisecond, and background execution can add a small, occasional delay. It's
+"feels instant," not "hard real-time."
 
 ### B. Zapier / IFTTT / Make
 
@@ -150,25 +192,38 @@ shape, so you don't have to reshape on their side.
 
 ## Deployment
 
-- **Postgres**: Supabase or Neon (free tier). Grab the connection string.
-- **App**: Vercel, Render, or Fly.io. Set env vars `DATABASE_URL` and
-  `INGEST_TOKEN`.
-- Point the iOS Shortcut and any Zaps at the deployed `/events` URL.
+Two viable shapes, both keeping it immediate:
+
+- **Recommended — Supabase Realtime:** Postgres + realtime managed for you. Ingest
+  can run anywhere (even a Vercel serverless route, since it only writes a row); the
+  browser subscribes to inserts over Supabase's WebSocket. Set `DATABASE_URL` /
+  Supabase keys and `INGEST_TOKEN`. Fewest moving parts for real-time.
+- **Fallback — persistent server + SSE:** run the app on **Render / Fly / Railway**
+  (a always-on process, *not* serverless, so it can hold SSE connections). It
+  `LISTEN`s on a Postgres channel and streams to browsers over `GET /stream` (SSE).
+  Postgres can still be Supabase or Neon.
+
+Avoid plain Vercel/Lambda as the *only* host if you go the SSE route — their
+function timeouts drop the live connection.
 
 ## Build phases
 
-1. **Walking skeleton** — `POST /events` writing to Postgres, and `GET /` showing
-   the last 50 rows. Deploy it. Prove one real notification from your phone lands
-   on the page.
-2. **Harden ingest** — token auth, validation, dedupe, structured errors.
-3. **Dashboard polish** — group by day, source icons/filters, auto-refresh,
-   relative timestamps.
-4. **Per-source adapters** — GitHub/Stripe/etc. routes; richer Shortcut recipes.
-5. **Nice-to-haves** — search, retention/cleanup job, mute rules, a "today"
-   summary.
+1. **Realtime walking skeleton** — `POST /events` writes a row; `GET /` loads the
+   last 50 and then **live-updates** via SSE/Realtime. Deploy it. Success = a real
+   notification from your phone appears on an already-open browser tab in ~1s, no
+   refresh.
+2. **Harden ingest** — token auth, validation, dedupe, fast response, structured
+   errors.
+3. **Dashboard polish** — source icons/filters, relative "just now" timestamps,
+   subtle highlight/sound on new arrival, reconnect handling.
+4. **Per-source adapters** — GitHub/Stripe/etc. routes; richer Shortcut recipes;
+   "Run Immediately" automations documented.
+5. **Nice-to-haves** — search, retention/cleanup, mute rules, a "today" summary.
 
 ## Open questions to settle before phase 1
 
-- Hosting target (Vercel vs Render vs Fly)?
+- **Realtime approach:** Supabase Realtime (recommended, simplest) vs
+  persistent-server + SSE?
+- **Stack for the app:** Node/TS, Python/FastAPI, or Next.js?
 - Single-user only, or room for more later? (Affects whether we add a `user_id`.)
 - How long to retain events (all-time vs rolling window)?
