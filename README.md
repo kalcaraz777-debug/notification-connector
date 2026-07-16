@@ -6,12 +6,20 @@ dashboard. New events appear in the browser in ~1 second with no refresh.
 Stack: **Next.js + Supabase Realtime**. See [`PLAN.md`](./PLAN.md) for the full
 design, the iOS constraints, and later phases.
 
-## What's in phase 1
+## What's here
 
-- `POST /api/events` — token-authenticated ingest endpoint. Feeders POST here.
+- `POST /api/events` — token-authenticated ingest endpoint. Feeders POST here;
+  it returns `{ ok, id, row_hash }` as an ACK so a courier can safely drop its
+  local copy.
 - A live dashboard at `/` — loads the last 50 events, then streams new ones over
   Supabase Realtime and prepends them.
-- Postgres schema in [`supabase/schema.sql`](./supabase/schema.sql).
+- An **append-only, hash-chained ledger** in
+  [`supabase/schema.sql`](./supabase/schema.sql): UPDATE/DELETE are blocked by
+  triggers and every row is chained to the previous, so tampering is detectable.
+  Run `select * from events_verify_chain();` as a periodic audit.
+- [`firmware/`](./firmware) — scaffold for an ESP32 that reads iPhone
+  notifications over ANCS and forwards them here, deleting each local copy only
+  after the server ACKs.
 
 ## Setup
 

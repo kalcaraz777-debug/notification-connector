@@ -39,6 +39,8 @@ export async function POST(request: Request) {
     url: payload.url ?? null,
     icon: payload.icon ?? null,
     occurred_at: payload.occurred_at ?? null,
+    device_seq: payload.device_seq ?? null,
+    device_ts: payload.device_ts ?? null,
     dedupe_key: payload.dedupe_key ?? null,
     raw: payload.raw ?? null,
   };
@@ -47,18 +49,25 @@ export async function POST(request: Request) {
     const supabase = getAdminClient();
 
     // Idempotent on dedupe_key: a retried POST won't create a duplicate.
-    const { error } = await supabase.from("events").upsert(row, {
-      onConflict: "dedupe_key",
-      ignoreDuplicates: true,
-    });
+    // The DB trigger computes the hash chain; we return the assigned id + hash
+    // as an ACK so the device can safely wipe the item from its flash queue.
+    const { data, error } = await supabase
+      .from("events")
+      .upsert(row, { onConflict: "dedupe_key", ignoreDuplicates: true })
+      .select("id, received_at, row_hash")
+      .maybeSingle();
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
+
+    // data is null when the row was a dedupe no-op; still a successful ACK.
+    return NextResponse.json(
+      { ok: true, id: data?.id ?? null, row_hash: data?.row_hash ?? null },
+      { status: 200 },
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : "unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
   }
-
-  return NextResponse.json({ ok: true }, { status: 200 });
 }

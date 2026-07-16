@@ -1,0 +1,7 @@
+# Secrets — never commit real WiFi creds or the ingest token
+config.h
+
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
